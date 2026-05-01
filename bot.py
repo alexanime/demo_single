@@ -424,21 +424,8 @@ def ensure_default_settings():
     with db_lock:
         cursor.execute("DELETE FROM settings WHERE key=?", ("template_session_minutes",))
         conn.commit()
-    if DEMO_MODE and get_template_config() is None:
-        # Seed a default working schedule so the calendar has slots to display
-        # without requiring an admin to configure anything.
-        set_setting("template_start", "10:00")
-        set_setting("template_end", "20:00")
-        set_setting(
-            "template_blocks",
-            json.dumps(
-                [
-                    {"start": "10:00", "end": "14:00", "kind": "work"},
-                    {"start": "14:00", "end": "15:00", "kind": "break"},
-                    {"start": "15:00", "end": "20:00", "kind": "work"},
-                ]
-            ),
-        )
+    # In demo mode the calendar/time-slot flow is rendered from in-memory
+    # constants, so no template / day_slots seeding is required.
 
 
 def safe_edit_message_text(text, chat_id, message_id, **kwargs):
@@ -1507,9 +1494,43 @@ def date_has_enough_time(date_value, service_duration, today=None):
     return False
 
 
+# Fixed time grid used by the demo flow: every day looks the same, every
+# slot is "available". Some slots are randomly hidden per (date, slot)
+# pair to make the demo feel realistic, but the choice is deterministic
+# so the same date always shows the same picture between renders.
+DEMO_TIME_SLOTS = (
+    "10:00", "11:00", "12:00", "13:00",
+    "15:00", "16:00", "17:00", "18:00", "19:00",
+)
+
+
+def _demo_slot_is_busy(date_value, slot):
+    # Hash-based pseudo-randomness: ~25% of slots show as busy, but the
+    # decision is stable so reopening the same date doesn't shuffle them.
+    return (hash((date_value, slot)) & 0xFF) < 64
+
+
+def _demo_available_count(date_value):
+    return sum(1 for s in DEMO_TIME_SLOTS if not _demo_slot_is_busy(date_value, s))
+
+
 def get_available_dates_map(year, month, service_duration=None):
-    result = {}
     today = datetime.date.today()
+    if DEMO_MODE:
+        # Every future day in the rendered month is "open" with the demo grid.
+        result = {}
+        for day in range(1, 32):
+            try:
+                current = datetime.date(year, month, day)
+            except ValueError:
+                continue
+            if current <= today:
+                continue
+            count = _demo_available_count(current.isoformat())
+            if count:
+                result[day] = count
+        return result
+    result = {}
     now = datetime.datetime.now()
     for day in range(1, 32):
         try:
@@ -1534,6 +1555,23 @@ def get_available_dates_map(year, month, service_duration=None):
         if usable:
             result[day] = usable
     return result
+
+
+def get_demo_time_slots_markup(date_value):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    for slot in DEMO_TIME_SLOTS:
+        if _demo_slot_is_busy(date_value, slot):
+            buttons.append(types.InlineKeyboardButton(f"{slot} — занято", callback_data="busy"))
+        else:
+            buttons.append(
+                types.InlineKeyboardButton(
+                    slot, callback_data=f"demotime_{date_value}_{slot}"
+                )
+            )
+    markup.add(*buttons)
+    markup.add(types.InlineKeyboardButton("Назад", callback_data="back_calendar"))
+    return markup
 
 
 def get_calendar(year, month, service_duration=None):
@@ -3167,11 +3205,39 @@ def callback_router(call):
         date_value = data.split("_", 1)[1]
         user_data.setdefault(user_id, {})
         user_data[user_id]["date"] = date_value
+        if DEMO_MODE:
+            safe_edit_message_text(
+                f"Выберите время на {date_value}",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_demo_time_slots_markup(date_value),
+            )
+            return
         safe_edit_message_text(
             f"Выберите время на {date_value}",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_time_slots_markup(date_value, user_id),
+        )
+        return
+
+    if DEMO_MODE and data.startswith("demotime_"):
+        # Format: demotime_YYYY-MM-DD_HH:MM
+        _, date_value, slot_time = data.split("_", 2)
+        try:
+            human_date = datetime.datetime.strptime(date_value, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            human_date = date_value
+        safe_edit_message_text(
+            (
+                f"Готово! Вы записаны на {human_date} в {slot_time}. ✨\n\n"
+                "Это демонстрационный бот — реальной записи не сохраняется. "
+                "У настоящего бота на этом месте мастер получил бы уведомление, "
+                "а клиенту пришло бы то же подтверждение и напоминание за день.\n\n"
+                f"Спасибо, что попробовали! Хотите такого же бота себе? Напишите {DEMO_USERNAME}"
+            ),
+            call.message.chat.id,
+            call.message.message_id,
         )
         return
 
@@ -3185,20 +3251,6 @@ def callback_router(call):
             slot = cursor.fetchone()
         if not slot or slot[2] or slot[3] or is_less_than_24_hours(slot[0], slot[1]):
             bot.answer_callback_query(call.id, "Это окно недоступно")
-            return
-        if DEMO_MODE:
-            # Show a polished confirmation; never write to DB or notify an admin.
-            safe_edit_message_text(
-                (
-                    f"Готово! Вы записаны на {slot[0]} в {slot[1]}. ✨\n\n"
-                    "Это демонстрационный бот — реальной записи не сохраняется. "
-                    "У настоящего бота на этом месте мастер получил бы уведомление, "
-                    "а клиенту пришло бы то же подтверждение и напоминание за день.\n\n"
-                    f"Хотите такого же бота себе? Напишите {DEMO_USERNAME}"
-                ),
-                call.message.chat.id,
-                call.message.message_id,
-            )
             return
         user_data.setdefault(user_id, {})
         user_data[user_id]["slot_id"] = slot_id
