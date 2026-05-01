@@ -61,7 +61,7 @@ PORTFOLIO_DIR = os.getenv("PORTFOLIO_DIR", "portfolio_examples")
 # notifications and DB writes for bookings are short-circuited; the user sees
 # polished confirmations explaining that this is a demo.
 DEMO_MODE = os.getenv("DEMO_MODE", "1").strip() not in ("", "0", "false", "False")
-DEMO_USERNAME = os.getenv("DEMO_USERNAME", "@al_username").strip()
+DEMO_USERNAME = os.getenv("DEMO_USERNAME", "@kilolown").strip()
 DEMO_TARIFFS_URL = os.getenv("DEMO_TARIFFS_URL", "https://t.me/your_channel").strip()
 
 if TOKEN in ("", "YOUR_TOKEN") or ":" not in TOKEN:
