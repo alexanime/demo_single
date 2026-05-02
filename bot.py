@@ -2347,8 +2347,8 @@ def about_tariffs(message):
             f"{DEMO_TARIFFS_URL}\n\n"
             "Тарифы вкратце:\n"
             "• Старт — визитка с заявкой, от 15 000 ₽\n"
-            "• Стандарт — запись по календарю, от 50 000 ₽\n"
-            "• Премиум — этот бот без ограничений демо, от 120 000 ₽\n\n"
+            "• Стандарт — запись по календарю, от 25 000 ₽\n"
+            "• Премиум — этот бот без ограничений демо, от 50 000 ₽\n\n"
             f"Заказать или задать вопрос: {DEMO_USERNAME}"
         ),
     )
@@ -4349,4 +4349,4 @@ ensure_default_settings()
 ensure_portfolio_placeholders()
 threading.Thread(target=reminder_loop, daemon=True).start()
 threading.Thread(target=run_flask, daemon=True).start()
-bot.infinity_polling()
+bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=30)
