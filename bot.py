@@ -1,6 +1,7 @@
 import collections
 import datetime
 import json
+import logging
 import os
 import sqlite3
 import struct
@@ -8,9 +9,44 @@ import threading
 import time
 import zlib
 
+import requests
 import telebot
 from flask import Flask, jsonify
 from telebot import types
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("demo_single")
+
+# Transient network failures that should be retried (Connection reset by peer,
+# socket timeouts, etc). When the VPS network blips, Telegram drops the TLS
+# connection mid-call; we retry a couple of times before giving up so the
+# polling loop doesn't die from a single dropped packet.
+_TRANSIENT_NETWORK_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    ConnectionResetError,
+)
+
+
+class _ResilientExceptionHandler(telebot.ExceptionHandler):
+    """Swallow handler-level exceptions so infinity_polling never dies.
+
+    Without this, an unhandled ConnectionError inside e.g. send_media_group
+    propagates all the way up to the polling loop and kills it. infinity_polling
+    then takes a few seconds to come back, during which the bot looks frozen.
+    """
+
+    def handle(self, exception):
+        logger.warning(
+            "Bot handler raised %s; swallowed to keep polling alive",
+            type(exception).__name__,
+            exc_info=exception,
+        )
+        return True
 
 def load_env_file(path=".env"):
     if not os.path.exists(path):
@@ -70,7 +106,42 @@ if TOKEN in ("", "YOUR_TOKEN") or ":" not in TOKEN:
         "переменную окружения TELEGRAM_TOKEN токеном от @BotFather."
     )
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, exception_handler=_ResilientExceptionHandler())
+
+
+def _send_media_group_with_retry(chat_id, image_paths, caption, attempts=3, backoff=0.5):
+    """Send a media group, re-opening file handles on each retry."""
+    last_exc = None
+    for attempt in range(attempts):
+        media = []
+        handles = []
+        try:
+            for index, path in enumerate(image_paths):
+                photo = open(path, "rb")
+                handles.append(photo)
+                media.append(
+                    types.InputMediaPhoto(photo, caption=caption if index == 0 else "")
+                )
+            return bot.send_media_group(chat_id, media)
+        except _TRANSIENT_NETWORK_EXCEPTIONS as exc:
+            last_exc = exc
+            logger.warning(
+                "send_media_group attempt %d/%d failed: %s",
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            if attempt + 1 < attempts:
+                time.sleep(backoff * (attempt + 1))
+        finally:
+            for handle in handles:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+    raise last_exc
+
+
 app = Flask(__name__)
 
 db_lock = threading.Lock()
@@ -2925,21 +2996,25 @@ def callback_router(call):
         # linger as a duplicate "Назад" anchor after returning to service info.
         safe_delete_message(call.message.chat.id, call.message.message_id)
         if images:
-            media = []
-            handles = []
-            for index, image in enumerate(images):
-                photo = open(image, "rb")
-                handles.append(photo)
-                media.append(
-                    types.InputMediaPhoto(photo, caption=caption if index == 0 else "")
-                )
             try:
-                sent = bot.send_media_group(call.message.chat.id, media)
+                sent = _send_media_group_with_retry(
+                    call.message.chat.id, images, caption
+                )
                 for m in sent:
                     add_step_msg(user_id, m.message_id)
-            finally:
-                for handle in handles:
-                    handle.close()
+            except _TRANSIENT_NETWORK_EXCEPTIONS as exc:
+                logger.warning(
+                    "Portfolio media group failed after retries: %s", exc
+                )
+                fallback = bot.send_message(
+                    call.message.chat.id,
+                    (
+                        f"{caption}\n\n"
+                        "(Сейчас сеть моргает — фото не загрузились. "
+                        "Попробуй ещё раз через секунду 🙏)"
+                    ),
+                )
+                add_step_msg(user_id, fallback.message_id)
         else:
             sent = bot.send_message(call.message.chat.id, caption)
             add_step_msg(user_id, sent.message_id)
